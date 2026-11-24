@@ -1,0 +1,721 @@
+"""Active probing (detection mode) — confirm weaknesses, never exploit them.
+
+This module is the opt-in "active" profile. It sends requests whose only
+purpose is to *detect and report* a weakness using benign marker payloads and
+response / error / timing signatures. It never extracts data, alters state,
+gains a shell, or follows an exploit through.
+
+HARD SAFETY CONTROLS (all enforced here):
+
+* **Gated** — does nothing unless ``config.active`` is True (the ``--active``
+  flag / TUI toggle) *and* the global authorization gate has already passed.
+* **Scope-enforced** — every request's host is checked against a
+  :class:`~allscan.scope.ScopeGuard`; out-of-scope hosts are blocked and logged.
+* **Rate-limited & concurrency-capped** — reuses the global rate limiter and a
+  conservative active-only worker cap.
+* **Kill switch & cancel** — honours the shared cancel token (TUI Stop / Ctrl+C).
+* **Automatic stop condition** — halts active probing after a configurable run
+  of consecutive request errors.
+* **Non-destructive** — markers are inert (alphanumeric reflect tokens, a single
+  quote for error-based signatures, a ``.invalid`` redirect target that can
+  never resolve). No payload changes server state.
+
+Each finding carries: ``{type, location, severity, evidence, confidence,
+note="manual validation required"}``.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import re
+import secrets
+import threading
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from allscan.base import Module, ModuleContext
+from allscan.models import Category, Finding, Severity
+from allscan.scope import ScopeGuard
+
+try:
+    import requests  # type: ignore
+    from requests.exceptions import RequestException  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None
+    RequestException = Exception
+
+
+REDIRECT_PARAMS = {"next", "url", "redirect", "redirect_uri", "return", "returnurl",
+                   "return_to", "dest", "destination", "continue", "r", "u", "goto",
+                   "to", "out", "view", "target"}
+
+# SQL error signatures (error-based detection only — a single quote triggers a
+# parser error; no UNION/stacked queries, no data extraction).
+SQL_ERROR_SIGNATURES = [
+    r"you have an error in your sql syntax",
+    r"warning: mysqli?_",
+    r"unclosed quotation mark after the character string",
+    r"quoted string not properly terminated",
+    r"ora-0\d{4}",
+    r"postgresql.*error",
+    r"pg_query\(\)",
+    r"sqlite(3)?::|sqlite3\.operationalerror|sqlite error",
+    r"microsoft (odbc|ole db|sql server)",
+    r"odbc sql server driver",
+    r"syntax error at or near",
+    r"sqlstate\[",
+]
+
+# Path-disclosure / file-handling error signatures (traversal influence),
+# detected WITHOUT requesting real system files.
+PATH_ERROR_SIGNATURES = [
+    r"failed to open stream",
+    r"no such file or directory",
+    r"open_basedir restriction",
+    r"java\.io\.filenotfoundexception",
+    r"system\.io\.filenotfoundexception",
+    r"/var/www/|/usr/share/|/home/\w+/|c:\\\\(inetpub|windows)",
+]
+
+MARKER_PREFIX = "allscanprobe"
+OOB_REDIR = "https://allscan-oob.invalid/probe"
+
+
+class ActiveContext:
+    """Per-run active-probing state: kill switch, error budget, caps."""
+
+    def __init__(self, ctx: ModuleContext):
+        prof = ctx.config.profile() if hasattr(ctx.config, "profile") else {}
+        self.deep = bool(prof.get("deep_checks"))
+        self.max_level = bool(prof.get("max_checks"))
+        # intensity raises the caps but never lowers an operator's explicit value
+        self.cap = max(1, min(ctx.config.threads,
+                              max(int(getattr(ctx.config, "active_max_concurrency", 8)),
+                                  int(prof.get("concurrency", 0)))))
+        self.max_urls = max(int(getattr(ctx.config, "active_max_urls", 25)),
+                            int(prof.get("urls", 0)))
+        self.max_params = max(int(getattr(ctx.config, "active_max_params", 6)),
+                              int(prof.get("params", 0)))
+        self.stop_after_errors = int(getattr(ctx.config, "active_stop_after_errors", 25))
+        self._errors = 0
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+
+    def record_error(self) -> None:
+        with self._lock:
+            self._errors += 1
+            if self._errors >= self.stop_after_errors:
+                self._stopped.set()
+
+    def record_ok(self) -> None:
+        with self._lock:
+            self._errors = 0  # consecutive-error budget
+
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
+
+class ActiveModule(Module):
+    name = "active"
+    label = "Active Probing (detection)"
+
+    def run(self, ctx: ModuleContext) -> list[Finding]:
+        # --- gate 1: must be explicitly enabled -------------------------
+        if not getattr(ctx.config, "active", False):
+            ctx.log("Active probing disabled (enable with --active). Skipping.")
+            return [
+                ctx.emit(
+                    Finding(
+                        category=Category.ACTIVE,
+                        title="Active probing disabled",
+                        severity=Severity.INFO,
+                        target=ctx.target,
+                        description="Active checks are opt-in. Re-run with --active "
+                                    "(and authorization) to enable detection-mode probing.",
+                        module=self.name,
+                    )
+                )
+            ]
+        if requests is None:
+            ctx.log("requests not installed; active probing unavailable.")
+            return []
+
+        guard = ctx.scope or ScopeGuard(
+            target=ctx.target,
+            allow=list(getattr(ctx.config, "scope_allow", []) or []),
+            deny=list(getattr(ctx.config, "scope_deny", []) or []),
+        )
+        # --- gate 2: production warning ---------------------------------
+        if guard.looks_production() and not getattr(ctx.config, "allow_production", False):
+            ctx.log("WARNING: target looks like PRODUCTION. Active probing proceeds "
+                    "non-destructively; pass allow_production to silence this warning.")
+
+        actx = ActiveContext(ctx)
+        ctx.log(f"Intensity: {getattr(ctx.config, 'intensity', 'standard')} "
+                f"(deep checks={'on' if actx.deep else 'off'}, "
+                f"max checks={'on' if actx.max_level else 'off'}).")
+        ctx.log(f"Active probing ENABLED — detection-only, scope={ctx.target} "
+                f"(+{len(guard.allow)} allow / {len(guard.deny)} deny), "
+                f"cap={actx.cap}, stop-after-errors={actx.stop_after_errors}.")
+
+        urls = self._candidate_urls(ctx, guard, actx)
+        if not urls:
+            ctx.log("No in-scope URLs to actively probe.")
+            return []
+
+        findings: list[Finding] = []
+        lock = threading.Lock()
+
+        def work(url: str) -> list[Finding]:
+            if ctx.cancel.cancelled() or actx.stopped():
+                return []
+            local: list[Finding] = []
+            local += self._check_reflection(ctx, guard, actx, url)
+            local += self._check_open_redirect(ctx, guard, actx, url)
+            local += self._check_sqli_error(ctx, guard, actx, url)
+            local += self._check_dir_listing(ctx, guard, actx, url)
+            local += self._check_cors(ctx, guard, actx, url)
+            local += self._check_host_header(ctx, guard, actx, url)
+            if actx.deep:
+                local += self._check_http_methods(ctx, guard, actx, url)
+                local += self._check_template_eval(ctx, guard, actx, url)
+                local += self._check_crlf(ctx, guard, actx, url)
+                local += self._check_sqli_boolean(ctx, guard, actx, url)
+                local += self._check_error_disclosure(ctx, guard, actx, url)
+            if actx.max_level:
+                local += self._check_path_error(ctx, guard, actx, url)
+            return local
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actx.cap) as ex:
+            futures = [ex.submit(work, u) for u in urls]
+            for fut in concurrent.futures.as_completed(futures):
+                if ctx.cancel.cancelled():
+                    break
+                for f in fut.result():
+                    with lock:
+                        findings.append(ctx.emit(f))
+
+        # token analysis over observed cookies/headers/bodies (no requests)
+        for f in self._check_jwt(ctx):
+            findings.append(f)
+
+        if actx.stopped():
+            findings.append(
+                ctx.emit(
+                    Finding(
+                        category=Category.ACTIVE,
+                        title="Active probing stopped early (error threshold reached)",
+                        severity=Severity.INFO,
+                        target=ctx.target,
+                        description="The automatic stop condition halted active probing "
+                                    f"after {actx.stop_after_errors} consecutive request errors.",
+                        module=self.name,
+                    )
+                )
+            )
+        ctx.log(f"Active probing complete — {len(findings)} finding(s).")
+        return findings
+
+    # ------------------------------------------------------------------ #
+    # request helper with scope enforcement
+    # ------------------------------------------------------------------ #
+    def _request(self, ctx, guard, actx, url, *, allow_redirects=False):
+        host = urlparse(url).hostname or ""
+        decision = guard.decide(host)
+        if not decision.allowed:
+            ctx.audit.record("scope_blocked", url, reason=decision.reason)
+            return None
+        if ctx.cancel.cancelled() or actx.stopped():
+            return None
+        try:
+            resp = ctx.http_get(url, allow_redirects=allow_redirects,
+                                action="active_request")
+            actx.record_ok()
+            return resp
+        except RequestException:
+            actx.record_error()
+            return None
+
+    # ------------------------------------------------------------------ #
+    def _candidate_urls(self, ctx, guard, actx) -> list[str]:
+        """Collect in-scope URLs to probe: live web bases + any param-bearing
+        URLs seen in captured page bodies."""
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def add(u: str):
+            if u not in seen and guard.check(urlparse(u).hostname or ""):
+                seen.add(u)
+                urls.append(u)
+
+        for base in (ctx.state.get("web_hosts") or []):
+            add(base)
+        for base, page in (ctx.state.get("pages") or {}).items():
+            add(base)
+            body = page.get("body") or ""
+            for m in re.findall(r"""https?://[^\s"'<>()]+\?[^\s"'<>()]+""", body):
+                add(m)
+        if not urls:
+            add(f"https://{ctx.target}")
+            add(f"http://{ctx.target}")
+        return urls[: actx.max_urls]
+
+    def _params(self, url: str) -> list[tuple[str, str]]:
+        return parse_qsl(urlparse(url).query, keep_blank_values=True)
+
+    def _with_param(self, url: str, key: str, value: str) -> str:
+        parts = urlparse(url)
+        q = dict(parse_qsl(parts.query, keep_blank_values=True))
+        q[key] = value
+        return urlunparse(parts._replace(query=urlencode(q)))
+
+    def _with_raw_param(self, url: str, key: str, raw_value: str) -> str:
+        """Like :meth:`_with_param` but ``raw_value`` is inserted verbatim (already
+        percent-encoded), for probes that must not be double-encoded."""
+        parts = urlparse(url)
+        others = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                  if k != key]
+        query = "&".join(filter(None, [urlencode(others), f"{key}={raw_value}"]))
+        return urlunparse(parts._replace(query=query))
+
+    # ------------------------------------------------------------------ #
+    # detection checks (all benign, non-destructive)
+    # ------------------------------------------------------------------ #
+    def _check_reflection(self, ctx, guard, actx, url) -> list[Finding]:
+        params = self._params(url)[: actx.max_params]
+        # if no params, test a single synthetic one to see if arbitrary input reflects
+        if not params:
+            params = [("allscanq", "")]
+        out: list[Finding] = []
+        for key, _ in params:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            marker = MARKER_PREFIX + secrets.token_hex(4)
+            # deep+: add inert HTML metacharacters to see whether they survive
+            # unescaped (stronger XSS-sink signal). Never a script payload.
+            meta = ('"\'<>' if actx.deep else "")
+            test = self._with_param(url, key, marker + meta)
+            resp = self._request(ctx, guard, actx, test)
+            if resp is None or not resp.text:
+                continue
+            unescaped = bool(meta) and (marker + meta) in resp.text
+            if marker in resp.text:
+                in_script = bool(re.search(r"<script[^>]*>[^<]*" + re.escape(marker),
+                                           resp.text, re.IGNORECASE))
+                confidence = "high" if (in_script or unescaped) else "medium"
+                out.append(self._finding(
+                    "reflected-input", f"{url} [param={key}]",
+                    Severity.MEDIUM if (in_script or unescaped) else Severity.LOW,
+                    evidence={"param": key, "marker": marker,
+                              "status": resp.status_code,
+                              "reflected_in_script_context": in_script,
+                              "metacharacters_unescaped": unescaped},
+                    confidence=confidence,
+                    title=f"Reflected input observed (param '{key}')",
+                    description="A benign marker sent in this parameter was reflected "
+                                "verbatim in the response — potential XSS sink. No script "
+                                "payload was injected.",
+                ))
+        return out
+
+    def _check_open_redirect(self, ctx, guard, actx, url) -> list[Finding]:
+        params = {k for k, _ in self._params(url)} & REDIRECT_PARAMS
+        if not params:
+            return []
+        out: list[Finding] = []
+        for key in list(params)[: actx.max_params]:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            test = self._with_param(url, key, OOB_REDIR)
+            resp = self._request(ctx, guard, actx, test, allow_redirects=False)
+            if resp is None:
+                continue
+            loc = resp.headers.get("Location", "")
+            if resp.status_code in (301, 302, 303, 307, 308) and "allscan-oob.invalid" in loc:
+                out.append(self._finding(
+                    "open-redirect", f"{url} [param={key}]",
+                    Severity.MEDIUM,
+                    evidence={"param": key, "status": resp.status_code,
+                              "location": loc[:200], "marker_host": "allscan-oob.invalid"},
+                    confidence="high",
+                    title=f"Open redirect appears possible (param '{key}')",
+                    description="The server issued a redirect to an attacker-controllable "
+                                "value. The marker host is a non-resolvable .invalid domain; "
+                                "the redirect was not followed.",
+                ))
+        return out
+
+    def _check_sqli_error(self, ctx, guard, actx, url) -> list[Finding]:
+        params = self._params(url)[: actx.max_params]
+        if not params:
+            return []
+        out: list[Finding] = []
+        for key, orig in params:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            # baseline (original value) to avoid flagging pre-existing errors
+            base = self._request(ctx, guard, actx, self._with_param(url, key, orig or "1"))
+            base_text = (base.text.lower() if base is not None and base.text else "")
+            probe = self._request(ctx, guard, actx, self._with_param(url, key, (orig or "1") + "'"))
+            if probe is None or not probe.text:
+                continue
+            text = probe.text.lower()
+            for sig in SQL_ERROR_SIGNATURES:
+                if re.search(sig, text) and not re.search(sig, base_text):
+                    out.append(self._finding(
+                        "sql-injection", f"{url} [param={key}]",
+                        Severity.HIGH,
+                        evidence={"param": key, "signature": sig,
+                                  "status": probe.status_code,
+                                  "technique": "error-based (single quote)"},
+                        confidence="medium",
+                        title=f"Parameter appears injectable (SQL error, param '{key}')",
+                        description="Appending a single quote produced a database error "
+                                    "signature absent from the baseline response. Detection "
+                                    "only — no data was extracted and no stacked/UNION query "
+                                    "was sent.",
+                    ))
+                    break
+        return out
+
+    def _check_dir_listing(self, ctx, guard, actx, url) -> list[Finding]:
+        # confirm directory listing on the URL's own path
+        resp = self._request(ctx, guard, actx, url)
+        if resp is None or resp.status_code != 200 or not resp.text:
+            return []
+        if any(m in resp.text for m in ("Index of /", "<title>Directory listing for",
+                                        "Parent Directory</a>")):
+            return [self._finding(
+                "directory-listing", url, Severity.MEDIUM,
+                evidence={"status": resp.status_code},
+                confidence="high",
+                title="Directory listing enabled (confirmed)",
+                description="The server returned an auto-generated directory index "
+                            "(confirmed by active request).",
+            )]
+        return []
+
+    def _check_cors(self, ctx, guard, actx, url) -> list[Finding]:
+        """Reflected-origin CORS misconfig: send an arbitrary Origin and see if
+        it is reflected with credentials allowed. Benign header only."""
+        host = urlparse(url).hostname or ""
+        decision = guard.decide(host)
+        if not decision.allowed:
+            ctx.audit.record("scope_blocked", url, reason=decision.reason)
+            return []
+        if ctx.cancel.cancelled() or actx.stopped():
+            return []
+        evil = "https://allscan-cors.invalid"
+        try:
+            resp = ctx.http_get(url, headers={"Origin": evil}, allow_redirects=False,
+                                action="active_request", check="cors")
+            actx.record_ok()
+        except RequestException:
+            actx.record_error()
+            return []
+        acao = resp.headers.get("Access-Control-Allow-Origin", "")
+        acac = resp.headers.get("Access-Control-Allow-Credentials", "").lower()
+        if acao == evil or acao == "*":
+            reflects = acao == evil
+            sev = Severity.HIGH if (reflects and acac == "true") else (
+                Severity.MEDIUM if reflects else Severity.LOW)
+            return [self._finding(
+                "cors-misconfig", url, sev,
+                evidence={"acao": acao, "acac": acac, "sent_origin": evil,
+                          "reflects_arbitrary_origin": reflects},
+                confidence="high" if reflects else "medium",
+                title="Permissive CORS policy" + (" with credentials" if acac == "true" else ""),
+                description="The server reflected an arbitrary Origin in "
+                            "Access-Control-Allow-Origin" +
+                            (" and allows credentials — cross-origin data exposure risk."
+                             if acac == "true" else " (or uses a wildcard)."),
+            )]
+        return []
+
+    def _check_host_header(self, ctx, guard, actx, url) -> list[Finding]:
+        """Host-header injection: send a marker Host and see if it is reflected
+        in the body or a redirect (cache-poisoning / routing indicator)."""
+        host = urlparse(url).hostname or ""
+        decision = guard.decide(host)
+        if not decision.allowed:
+            ctx.audit.record("scope_blocked", url, reason=decision.reason)
+            return []
+        if ctx.cancel.cancelled() or actx.stopped():
+            return []
+        marker = "allscan-hh.invalid"
+        try:
+            resp = ctx.http_get(url, headers={"Host": marker}, allow_redirects=False,
+                                action="active_request", check="host-header")
+            actx.record_ok()
+        except RequestException:
+            actx.record_error()
+            return []
+        loc = resp.headers.get("Location", "")
+        body_head = (resp.text or "")[:4000]
+        if marker in loc or marker in body_head:
+            where = "redirect Location" if marker in loc else "response body"
+            return [self._finding(
+                "host-header-injection", url, Severity.MEDIUM,
+                evidence={"marker": marker, "status": resp.status_code,
+                          "reflected_in": where, "location": loc[:200]},
+                confidence="medium",
+                title="Host header reflected (possible host-header injection)",
+                description=f"A spoofed Host header was reflected in the {where} — "
+                            "can enable cache poisoning or password-reset poisoning.",
+            )]
+        return []
+
+    def _check_jwt(self, ctx) -> list[Finding]:
+        """Analyse any JWTs observed in captured cookies/headers/bodies. Decodes
+        (does NOT verify) header/payload and flags weak settings. No requests."""
+        import base64
+        import json as _json
+
+        out: list[Finding] = []
+        seen: set[str] = set()
+        blobs: list[str] = []
+        for base, page in (ctx.state.get("pages") or {}).items():
+            blobs.append(page.get("body") or "")
+            for k, v in (page.get("headers") or {}).items():
+                blobs.append(f"{k}: {v}")
+            for c in page.get("cookies") or []:
+                blobs.append(str(c))
+        jwt_re = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,}")
+        for blob in blobs:
+            for m in jwt_re.findall(blob):
+                if m in seen:
+                    continue
+                seen.add(m)
+                try:
+                    h_b64 = m.split(".")[0]
+                    header = _json.loads(base64.urlsafe_b64decode(h_b64 + "==="))
+                except Exception:
+                    continue
+                alg = str(header.get("alg", "")).lower()
+                issues = []
+                if alg == "none":
+                    issues.append("alg=none (signature not verified)")
+                if alg in ("hs256", "hs384", "hs512"):
+                    issues.append(f"symmetric alg {alg} (key-confusion risk if RS expected)")
+                sev = Severity.HIGH if alg == "none" else (
+                    Severity.LOW if issues else Severity.INFO)
+                out.append(self._finding(
+                    "jwt-analysis", "(observed token)", sev,
+                    evidence={"alg": header.get("alg"), "header": header,
+                              "issues": issues, "token_prefix": m[:12] + "…"},
+                    confidence="medium" if issues else "low",
+                    title=f"JWT observed (alg={header.get('alg')})"
+                          + (" — weak settings" if issues else ""),
+                    description="A JSON Web Token was observed and its header decoded "
+                                "(not verified). " + ("; ".join(issues) if issues else
+                                "No obvious header weaknesses."),
+                ))
+        return out
+
+    # ------------------------------------------------------------------ #
+    # deeper checks (intensity=deep / max) — still benign and non-destructive
+    # ------------------------------------------------------------------ #
+    def _check_http_methods(self, ctx, guard, actx, url) -> list[Finding]:
+        """Risky-method exposure: read the OPTIONS ``Allow`` list and confirm
+        TRACE echo with a marker header. No PUT/DELETE is ever sent."""
+        out: list[Finding] = []
+        host = urlparse(url).hostname or ""
+        if not guard.decide(host).allowed or ctx.cancel.cancelled() or actx.stopped():
+            return out
+        try:
+            resp = ctx.http_request("options", url, allow_redirects=False,
+                                    action="active_request", check="http-methods")
+            actx.record_ok()
+        except RequestException:
+            actx.record_error()
+            return out
+        allow = (resp.headers.get("Allow", "") + "," +
+                 resp.headers.get("Access-Control-Allow-Methods", "")).upper()
+        risky = sorted({m for m in ("PUT", "DELETE", "TRACE", "CONNECT", "PATCH")
+                        if re.search(rf"\b{m}\b", allow)})
+        if risky:
+            sev = Severity.MEDIUM if {"PUT", "DELETE"} & set(risky) else Severity.LOW
+            out.append(self._finding(
+                "http-methods", url, sev,
+                evidence={"allow": allow.strip(", "), "risky_methods": risky,
+                          "status": resp.status_code},
+                confidence="medium",
+                title="Risky HTTP methods advertised: " + ", ".join(risky),
+                description="The server advertises methods that are rarely needed on "
+                            "public endpoints. Advertised only — none of them was invoked.",
+            ))
+        marker = MARKER_PREFIX + secrets.token_hex(4)
+        try:
+            tr = ctx.http_request("trace", url, headers={"X-Allscan-Trace": marker},
+                                  allow_redirects=False, action="active_request",
+                                  check="trace")
+            actx.record_ok()
+            if tr.status_code == 200 and marker in (tr.text or ""):
+                out.append(self._finding(
+                    "http-trace", url, Severity.LOW,
+                    evidence={"marker": marker, "status": tr.status_code},
+                    confidence="high",
+                    title="HTTP TRACE enabled (request echoed)",
+                    description="TRACE reflected a marker request header back in the body "
+                                "(cross-site tracing / header disclosure risk).",
+                ))
+        except RequestException:
+            actx.record_error()
+        return out
+
+    def _check_template_eval(self, ctx, guard, actx, url) -> list[Finding]:
+        """Template-injection indicator: an inert arithmetic expression whose
+        evaluated result differs from its literal form. Detection only."""
+        out: list[Finding] = []
+        params = self._params(url)[: actx.max_params] or [("allscanq", "")]
+        # (expression, expected evaluated token)
+        probes = [("{{7*7}}", "49"), ("${7*7}", "49"), ("<%= 7*7 %>", "49")]
+        for key, _ in params:
+            for expr, result in probes:
+                if ctx.cancel.cancelled() or actx.stopped():
+                    return out
+                tag = MARKER_PREFIX + secrets.token_hex(3)
+                resp = self._request(ctx, guard, actx,
+                                     self._with_param(url, key, f"{tag}{expr}{tag}"))
+                if resp is None or not resp.text:
+                    continue
+                if f"{tag}{result}{tag}" in resp.text and f"{tag}{expr}{tag}" not in resp.text:
+                    out.append(self._finding(
+                        "template-injection", f"{url} [param={key}]", Severity.HIGH,
+                        evidence={"param": key, "expression": expr, "evaluated_to": result,
+                                  "status": resp.status_code},
+                        confidence="medium",
+                        title=f"Server-side template expression evaluated (param '{key}')",
+                        description="An inert arithmetic expression was evaluated by the "
+                                    "server, which indicates a template-injection sink. "
+                                    "No code-execution payload was sent.",
+                    ))
+                    break
+        return out
+
+    def _check_crlf(self, ctx, guard, actx, url) -> list[Finding]:
+        """Response-splitting indicator: a CR/LF-encoded marker header that
+        shows up as a real response header. Header is inert."""
+        out: list[Finding] = []
+        params = self._params(url)[: actx.max_params] or [("allscanq", "")]
+        for key, _ in params:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            token = secrets.token_hex(4)
+            probe = self._with_raw_param(url, key, f"x%0d%0aX-Allscan-Crlf:{token}")
+            resp = self._request(ctx, guard, actx, probe)
+            if resp is not None and resp.headers.get("X-Allscan-Crlf") == token:
+                out.append(self._finding(
+                    "crlf-injection", f"{url} [param={key}]", Severity.MEDIUM,
+                    evidence={"param": key, "header": "X-Allscan-Crlf",
+                              "status": resp.status_code},
+                    confidence="high",
+                    title=f"CR/LF injected into response headers (param '{key}')",
+                    description="An encoded CR/LF in this parameter created a new response "
+                                "header (HTTP response splitting). Marker header only.",
+                ))
+        return out
+
+    def _check_sqli_boolean(self, ctx, guard, actx, url) -> list[Finding]:
+        """Boolean-differential SQLi indicator: compare an always-true and an
+        always-false condition against the baseline. Reads status/length only;
+        no UNION, stacked queries or data extraction."""
+        out: list[Finding] = []
+        for key, orig in self._params(url)[: actx.max_params]:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            base_val = orig or "1"
+            base = self._request(ctx, guard, actx, self._with_param(url, key, base_val))
+            true_r = self._request(ctx, guard, actx,
+                                   self._with_param(url, key, base_val + "' AND '1'='1"))
+            false_r = self._request(ctx, guard, actx,
+                                    self._with_param(url, key, base_val + "' AND '1'='2"))
+            if base is None or true_r is None or false_r is None:
+                continue
+            bl, tl, fl = len(base.text or ""), len(true_r.text or ""), len(false_r.text or "")
+            same_as_base = abs(tl - bl) <= max(8, bl // 50)
+            differs = abs(tl - fl) > max(16, bl // 20)
+            if same_as_base and differs and true_r.status_code == base.status_code:
+                out.append(self._finding(
+                    "sql-injection", f"{url} [param={key}]", Severity.HIGH,
+                    evidence={"param": key, "technique": "boolean-differential",
+                              "baseline_len": bl, "true_len": tl, "false_len": fl,
+                              "status": true_r.status_code},
+                    confidence="medium",
+                    title=f"Parameter responds to boolean SQL conditions (param '{key}')",
+                    description="An always-true condition matched the baseline response "
+                                "while an always-false one changed it. Detection only — no "
+                                "data was read or modified.",
+                ))
+        return out
+
+    def _check_error_disclosure(self, ctx, guard, actx, url) -> list[Finding]:
+        """Verbose error / stack-trace disclosure triggered by a malformed
+        (not malicious) request: a NUL-byte escape in an unused parameter."""
+        if ctx.cancel.cancelled() or actx.stopped():
+            return []
+        resp = self._request(ctx, guard, actx, self._with_raw_param(url, "allscanq", "%00"))
+        if resp is None or not resp.text:
+            return []
+        text = resp.text
+        sigs = [r"traceback \(most recent call last\)", r"at [\w.$]+\([\w.]+\.java:\d+\)",
+                r"stack trace:", r"System\.\w+Exception", r"Fatal error:.*on line \d+",
+                r"Exception in thread", r"django\.|werkzeug debugger|laravel"]
+        hit = next((sg for sg in sigs if re.search(sg, text, re.IGNORECASE)), None)
+        if hit and resp.status_code >= 400:
+            return [self._finding(
+                "error-disclosure", url, Severity.MEDIUM,
+                evidence={"signature": hit, "status": resp.status_code},
+                confidence="medium",
+                title="Verbose error / stack trace disclosed",
+                description="A malformed request produced a framework error page with "
+                            "internal details (stack trace / debugger).",
+            )]
+        return []
+
+    def _check_path_error(self, ctx, guard, actx, url) -> list[Finding]:
+        """File-handling influence (max): feed a *non-existent* relative path
+        and look for file-system error signatures. No real system file is
+        ever requested."""
+        out: list[Finding] = []
+        for key, orig in self._params(url)[: actx.max_params]:
+            if ctx.cancel.cancelled() or actx.stopped():
+                break
+            base = self._request(ctx, guard, actx, self._with_param(url, key, orig or "1"))
+            base_text = (base.text.lower() if base is not None and base.text else "")
+            fake = f"../allscan-missing-{secrets.token_hex(4)}"
+            resp = self._request(ctx, guard, actx, self._with_param(url, key, fake))
+            if resp is None or not resp.text:
+                continue
+            text = resp.text.lower()
+            for sig in PATH_ERROR_SIGNATURES:
+                if re.search(sig, text) and not re.search(sig, base_text):
+                    out.append(self._finding(
+                        "path-handling", f"{url} [param={key}]", Severity.MEDIUM,
+                        evidence={"param": key, "signature": sig,
+                                  "status": resp.status_code, "probe": fake},
+                        confidence="medium",
+                        title=f"Parameter influences file path handling (param '{key}')",
+                        description="A non-existent relative path produced a file-system "
+                                    "error, suggesting the value reaches a file API. No real "
+                                    "file was requested.",
+                    ))
+                    break
+        return out
+
+    # ------------------------------------------------------------------ #
+    def _finding(self, ftype, location, severity, *, evidence, confidence,
+                 title, description) -> Finding:
+        ev = dict(evidence)
+        ev["type"] = ftype
+        return Finding(
+            category=Category.ACTIVE,
+            title=title,
+            severity=severity,
+            target=location.split(" ")[0],
+            description=description,
+            evidence=ev,
+            location=location,
+            confidence=confidence,
+            note="manual validation required",
+            module=self.name,
+        )

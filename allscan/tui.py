@@ -1,0 +1,913 @@
+"""Interactive terminal UI for allscan, built on textual.
+
+Screen flow:
+
+    Welcome (target + authorization)  ->  Modules (checklist)  ->  Settings
+         -> Scan (live progress)      ->  Results (grouped, exportable)
+    Past Scans (list + diff) is reachable from the Welcome screen.
+
+The scan itself runs on a background thread (textual worker) so the UI stays
+responsive; progress and findings are pushed back onto the UI thread via
+``call_from_thread``. Ctrl+C / the Stop binding cancel cooperatively and the
+Results screen still shows (and can export) whatever partial data exists.
+
+If textual is not installed, :func:`run_tui` raises ImportError and the caller
+(main.py) falls back to the headless runner.
+"""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from typing import Optional
+
+from allscan import BANNER, CREDIT
+from allscan.config import INTENSITY_LEVELS, MODULE_LABELS, Config
+from allscan.engine import MODULE_ORDER, Engine
+from allscan.models import Finding, ScanResult, Severity
+from allscan.utils import validate_target
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.widgets import (
+    Button,
+    Checkbox,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    RichLog,
+    Rule,
+    Select,
+    SelectionList,
+    Static,
+    Switch,
+)
+from textual.widgets.selection_list import Selection
+
+
+SEVERITY_STYLE = {
+    "high": "bold white on red",
+    "medium": "black on orange3",
+    "low": "black on yellow",
+    "info": "white on blue",
+}
+SEVERITY_COLOR = {
+    "high": "red",
+    "medium": "orange3",
+    "low": "yellow",
+    "info": "cyan",
+}
+
+# Bright per-line palette for the ASCII banner (cycled top to bottom).
+_BANNER_COLORS = ("#ff6b6b", "#feca57", "#1dd1a1", "#48dbfb", "#5f8cff", "#c56bff")
+
+
+def _rainbow_banner() -> str:
+    """Colorize the ASCII banner line by line for a vivid gradient look."""
+    lines = BANNER.strip("\n").splitlines() or [BANNER]
+    out = []
+    for i, line in enumerate(lines):
+        out.append(f"[b {_BANNER_COLORS[i % len(_BANNER_COLORS)]}]{line}[/]")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Welcome / target entry
+# --------------------------------------------------------------------------- #
+
+
+class WelcomeScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "app.quit", "Quit"),
+        Binding("a", "allscan", "Allscan (run everything)"),
+        Binding("p", "past_scans", "Past scans"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Container(id="welcome-box"):
+            yield Static(_rainbow_banner(), id="banner")
+            yield Static(
+                "[b #22d3ee]a[/][b #a78bfa]l[/][b #f472b6]l[/]"
+                "[b #fb923c]s[/][b #facc15]c[/][b #4ade80]a[/][b #22d3ee]n[/]"
+                "  [#94a3b8]— security recon for authorized testing[/]",
+                id="title",
+            )
+            yield Static(f"[b #facc15]✦[/] [b #f472b6]{CREDIT}[/] [b #facc15]✦[/]",
+                         id="credit")
+            yield Static(
+                "[dim]Scanning systems without explicit authorization may be "
+                "illegal. Confirm you have permission before running.[/dim]",
+                id="subtitle",
+            )
+            # quick-action bar: [A] runs every module back-to-back with defaults,
+            # the menu-driven equivalent of the --all CLI flag.
+            yield Static(
+                "[b #4ade80]\\[A][/] [#e2e8f0]Allscan (run everything)[/]   "
+                "[b #38bdf8]\\[P][/] [#e2e8f0]Past scans[/]   "
+                "[b #f87171]\\[Esc][/] [#e2e8f0]Quit[/]",
+                id="menu-bar",
+            )
+            yield Rule()
+            yield Label("Target (domain or IP):")
+            yield Input(placeholder="example.com", id="target-input")
+            yield Static("", id="target-error")
+            yield Checkbox(
+                "I have authorization to test this target",
+                id="auth-check",
+            )
+            with Horizontal(id="welcome-buttons"):
+                yield Button("▶ Allscan (run everything)", variant="success",
+                             id="allscan-btn")
+                yield Button("Configure & Scan →", variant="primary", id="start-btn")
+                yield Button("Past scans", id="past-btn")
+                yield Button("Quit", variant="error", id="quit-btn")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        if self.app.pending_target:  # type: ignore[attr-defined]
+            self.query_one("#target-input", Input).value = self.app.pending_target  # type: ignore[attr-defined]
+
+    def action_past_scans(self) -> None:
+        self.app.push_screen(PastScansScreen())
+
+    def action_allscan(self) -> None:
+        self._run_everything()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "quit-btn":
+            self.app.exit()
+        elif event.button.id == "past-btn":
+            self.action_past_scans()
+        elif event.button.id == "start-btn":
+            self._start()
+        elif event.button.id == "allscan-btn":
+            self._run_everything()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Typing "allscan" as the target is treated as the run-everything
+        # trigger (needs a real target, so prompt for one); otherwise start
+        # the normal configure flow.
+        if event.value.strip().lower() == "allscan":
+            self.query_one("#target-input", Input).value = ""
+            self.query_one("#target-error", Static).update(
+                "[yellow]Allscan selected — enter a target above, then press "
+                "[b]A[/b] or the Allscan button.[/yellow]"
+            )
+            return
+        self._start()
+
+    def _confirm_target(self) -> Optional[str]:
+        """Validate target + authorization; return normalized target or None."""
+        target_raw = self.query_one("#target-input", Input).value.strip()
+        error = self.query_one("#target-error", Static)
+        ok, msg = validate_target(target_raw)
+        if not ok:
+            error.update(f"[red]{msg}[/red]")
+            return None
+        if not self.query_one("#auth-check", Checkbox).value:
+            error.update("[red]You must confirm authorization before scanning.[/red]")
+            return None
+        error.update("")
+        self.app.target = msg  # type: ignore[attr-defined]
+        self.app.authorized = True  # type: ignore[attr-defined]
+        return msg
+
+    def _start(self) -> None:
+        if self._confirm_target() is None:
+            return
+        self.app.push_screen(ModulesScreen())
+
+    def _run_everything(self) -> None:
+        """Allscan: confirm target+auth once, then chain all modules with
+        default settings straight to the live scan (skips the checklist and
+        settings screens). Same behavior as the --all CLI flag."""
+        if self._confirm_target() is None:
+            return
+        self.app.config.modules = list(MODULE_ORDER)  # type: ignore[attr-defined]
+        self.app.push_screen(ScanScreen())
+
+
+# --------------------------------------------------------------------------- #
+# Module selection
+# --------------------------------------------------------------------------- #
+
+
+class ModulesScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("a", "select_all", "All"),
+        Binding("n", "select_none", "None"),
+        Binding("enter", "next", "Continue"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Container(id="modules-box"):
+            yield Static("[b #a78bfa]Select modules[/]  "
+                         "[dim](↑/↓ move · space toggle · "
+                         "[#4ade80]a[/]=all · [#f87171]n[/]=none · "
+                         "[#22d3ee]enter[/]=continue)[/dim]")
+            selected = set(self.app.config.modules)  # type: ignore[attr-defined]
+            options = [
+                Selection(MODULE_LABELS[m], m, m in selected)
+                for m in MODULE_ORDER
+            ]
+            yield SelectionList(*options, id="module-list")
+            with Horizontal(id="modules-buttons"):
+                yield Button("← Back", id="back-btn")
+                yield Button("Settings & Scan →", variant="primary", id="to-settings-btn")
+        yield Footer()
+
+    def action_select_all(self) -> None:
+        self.query_one(SelectionList).select_all()
+
+    def action_select_none(self) -> None:
+        self.query_one(SelectionList).deselect_all()
+
+    def action_next(self) -> None:
+        self._continue()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "back-btn":
+            self.app.pop_screen()
+        elif event.button.id == "to-settings-btn":
+            self._continue()
+
+    def _continue(self) -> None:
+        chosen = list(self.query_one(SelectionList).selected)
+        if not chosen:
+            self.notify("Select at least one module.", severity="error")
+            return
+        # keep canonical order
+        self.app.config.modules = [m for m in MODULE_ORDER if m in chosen]  # type: ignore[attr-defined]
+        self.app.push_screen(SettingsScreen())
+
+
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
+
+
+class SettingsScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        cfg: Config = self.app.config  # type: ignore[attr-defined]
+        yield Header(show_clock=True)
+        with VerticalScroll(id="settings-box"):
+            yield Static("[b]Settings[/b]")
+            yield Rule()
+            with Horizontal(classes="setting-row"):
+                yield Label("Full port range (1-65535)", classes="setting-label")
+                yield Switch(value=cfg.full_ports, id="full-ports")
+            with Horizontal(classes="setting-row"):
+                yield Label("Aggressive scan (deep version/banner + TLS)", classes="setting-label")
+                yield Switch(value=cfg.scan_intensity == "aggressive", id="aggressive")
+            with Horizontal(classes="setting-row"):
+                yield Label("nmap default scripts (-sC)", classes="setting-label")
+                yield Switch(value=cfg.scan_scripts, id="scan-scripts")
+            with Horizontal(classes="setting-row"):
+                yield Label("UDP sweep (nmap -sU, needs root)", classes="setting-label")
+                yield Switch(value=cfg.udp_scan, id="udp-scan")
+            with Horizontal(classes="setting-row"):
+                yield Label("Skip nmap (built-in scanner)", classes="setting-label")
+                yield Switch(value=cfg.skip_nmap, id="skip-nmap")
+            with Horizontal(classes="setting-row"):
+                yield Label("OS detection (nmap -O, needs root)", classes="setting-label")
+                yield Switch(value=cfg.os_detection, id="os-detection")
+            with Horizontal(classes="setting-row"):
+                yield Label("Thread count", classes="setting-label")
+                yield Input(value=str(cfg.threads), id="threads", type="integer")
+            with Horizontal(classes="setting-row"):
+                yield Label("Rate limit (req/sec, 0=unlimited)", classes="setting-label")
+                yield Input(value=str(cfg.rate_limit), id="rate-limit", type="number")
+            with Horizontal(classes="setting-row"):
+                yield Label("Per-request timeout (sec)", classes="setting-label")
+                yield Input(value=str(cfg.timeout), id="timeout", type="number")
+            with Horizontal(classes="setting-row"):
+                yield Label("Output directory", classes="setting-label")
+                yield Input(value=cfg.output_dir, id="output-dir")
+            yield Rule()
+            yield Static("[b]Active probing[/b] [dim](detection-only — sends requests "
+                         "to CONFIRM weaknesses, never exploit)[/dim]")
+            with Horizontal(classes="setting-row"):
+                yield Label("Enable active probing", classes="setting-label")
+                yield Switch(value=cfg.active, id="active")
+            with Horizontal(classes="setting-row"):
+                yield Label("Intensity (standard / deep / max)", classes="setting-label")
+                yield Select([(lvl, lvl) for lvl in INTENSITY_LEVELS],
+                             value=cfg.intensity if cfg.intensity in INTENSITY_LEVELS
+                             else "standard", allow_blank=False, id="intensity")
+            with Horizontal(classes="setting-row"):
+                yield Label("Scope allow (comma hosts/CIDRs)", classes="setting-label")
+                yield Input(value=", ".join(cfg.scope_allow), id="scope-allow")
+            with Horizontal(classes="setting-row"):
+                yield Label("Scope deny (comma, always blocked)", classes="setting-label")
+                yield Input(value=", ".join(cfg.scope_deny), id="scope-deny")
+            with Horizontal(classes="setting-row"):
+                yield Label("Acknowledge production target", classes="setting-label")
+                yield Switch(value=cfg.allow_production, id="allow-production")
+            yield Static("", id="active-warning")
+            yield Rule()
+            yield Static("[b]Outbound HTTP[/b] [dim](optional; auth is in-scope only)[/dim]")
+            with Horizontal(classes="setting-row"):
+                yield Label("Proxy URL (http/socks5)", classes="setting-label")
+                yield Input(value=cfg.proxy or "",
+                            placeholder="http://127.0.0.1:8080", id="proxy")
+            with Horizontal(classes="setting-row"):
+                yield Label("User-Agent override", classes="setting-label")
+                yield Input(value=cfg.user_agent, id="user-agent")
+            with Horizontal(classes="setting-row"):
+                yield Label("Extra header (Name: Value)", classes="setting-label")
+                yield Input(value="; ".join(f"{k}: {v}" for k, v in cfg.extra_headers.items()),
+                            placeholder="X-Bug-Bounty: handle", id="extra-header")
+            with Horizontal(classes="setting-row"):
+                yield Label("Cookie", classes="setting-label")
+                yield Input(value=cfg.cookie or "", password=True, id="cookie")
+            with Horizontal(classes="setting-row"):
+                yield Label("Auth bearer token", classes="setting-label")
+                yield Input(value=cfg.auth_bearer or "", password=True, id="auth-bearer")
+            yield Rule()
+            yield Static("[b]Delivery[/b] [dim](optional)[/dim]")
+            with Horizontal(classes="setting-row"):
+                yield Label("Discord webhook URL", classes="setting-label")
+                yield Input(value=cfg.discord_webhook or "",
+                            placeholder="https://discord.com/api/webhooks/…",
+                            password=True, id="discord-webhook")
+            with Horizontal(id="settings-buttons"):
+                yield Button("← Back", id="back-btn")
+                yield Button("Start scan ▶", variant="success", id="scan-btn")
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "back-btn":
+            self.app.pop_screen()
+        elif event.button.id == "scan-btn":
+            self._apply_and_scan()
+
+    def _apply_and_scan(self) -> None:
+        cfg: Config = self.app.config  # type: ignore[attr-defined]
+        cfg.full_ports = self.query_one("#full-ports", Switch).value
+        _lvl = self.query_one("#intensity", Select).value
+        cfg.intensity = _lvl if _lvl in INTENSITY_LEVELS else "standard"
+        cfg.scan_intensity = (
+            "aggressive" if self.query_one("#aggressive", Switch).value else "normal")
+        cfg.scan_scripts = self.query_one("#scan-scripts", Switch).value
+        cfg.udp_scan = self.query_one("#udp-scan", Switch).value
+        cfg.skip_nmap = self.query_one("#skip-nmap", Switch).value
+        cfg.os_detection = self.query_one("#os-detection", Switch).value
+        try:
+            cfg.threads = max(1, int(self.query_one("#threads", Input).value or cfg.threads))
+            cfg.rate_limit = float(self.query_one("#rate-limit", Input).value or cfg.rate_limit)
+            cfg.timeout = float(self.query_one("#timeout", Input).value or cfg.timeout)
+        except ValueError:
+            self.notify("Numeric settings must be numbers.", severity="error")
+            return
+        cfg.output_dir = self.query_one("#output-dir", Input).value or cfg.output_dir
+
+        # active probing settings
+        cfg.active = self.query_one("#active", Switch).value
+        cfg.allow_production = self.query_one("#allow-production", Switch).value
+        cfg.scope_allow = [s.strip() for s in
+                           self.query_one("#scope-allow", Input).value.split(",") if s.strip()]
+        cfg.scope_deny = [s.strip() for s in
+                          self.query_one("#scope-deny", Input).value.split(",") if s.strip()]
+        cfg.proxy = self.query_one("#proxy", Input).value.strip() or None
+        cfg.user_agent = self.query_one("#user-agent", Input).value.strip() or cfg.user_agent
+        hdr = self.query_one("#extra-header", Input).value.strip()
+        cfg.extra_headers = {}
+        for part in hdr.split(";"):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                cfg.extra_headers[k.strip()] = v.strip()
+        cfg.cookie = self.query_one("#cookie", Input).value.strip() or None
+        cfg.auth_bearer = self.query_one("#auth-bearer", Input).value.strip() or None
+        cfg.discord_webhook = self.query_one("#discord-webhook", Input).value.strip() or None
+        if cfg.discord_webhook:
+            from allscan.notify import looks_like_webhook
+            if not looks_like_webhook(cfg.discord_webhook):
+                self.notify("That doesn't look like a Discord webhook URL — reports "
+                            "will still be saved locally, but delivery may fail.",
+                            severity="warning", timeout=6)
+        if cfg.active:
+            from allscan.scope import ScopeGuard
+
+            guard = ScopeGuard(self.app.target, cfg.scope_allow, cfg.scope_deny)  # type: ignore[attr-defined]
+            if guard.looks_production() and not cfg.allow_production:
+                self.notify(
+                    "Active probing on a PRODUCTION-looking target. Detection-only and "
+                    "non-destructive. Tick 'Acknowledge production target' to silence.",
+                    severity="warning", timeout=6,
+                )
+        self.app.push_screen(ScanScreen())
+
+
+# --------------------------------------------------------------------------- #
+# Live scan
+# --------------------------------------------------------------------------- #
+
+
+class ScanScreen(Screen):
+    BINDINGS = [
+        Binding("ctrl+c", "stop", "Stop"),
+        Binding("s", "stop", "Stop"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.engine: Optional[Engine] = None
+        self._count = 0
+        self._stopped = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="scan-box"):
+            yield Static("", id="scan-title")
+            with Horizontal(id="scan-top"):
+                yield DataTable(id="module-status", zebra_stripes=True)
+                yield Static("", id="counter-panel")
+            yield Label("Activity log:")
+            yield RichLog(id="activity-log", highlight=True, markup=True, max_lines=500)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        cfg: Config = self.app.config  # type: ignore[attr-defined]
+        target: str = self.app.target  # type: ignore[attr-defined]
+        self.query_one("#scan-title", Static).update(
+            f"[b]Scanning[/b] [cyan]{target}[/cyan]  "
+            f"[dim](modules: {', '.join(cfg.modules)})[/dim]"
+        )
+        table = self.query_one("#module-status", DataTable)
+        table.add_columns("Module", "Status")
+        self._rows: dict[str, object] = {}
+        for m in cfg.modules:
+            key = table.add_row(MODULE_LABELS.get(m, m), "… queued")
+            self._rows[m] = key
+        self._update_counter()
+        self.start_scan()
+
+    # ------------------------------------------------------------------ #
+    # These three run from a background worker thread via call_from_thread,
+    # so a late callback can arrive after the scan finished and the screen was
+    # switched out (e.g. on Ctrl+C / Stop). They are best-effort display
+    # updates — swallow errors and bail if the screen is no longer mounted.
+    def _update_counter(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#counter-panel", Static).update(
+                f"\n [b]{self._count}[/b]\n findings\n\n"
+                f" [dim]{'cancelling…' if self._stopped else 'running'}[/dim]"
+            )
+        except Exception:
+            pass
+
+    def _set_status(self, module: str, status: str) -> None:
+        if not self.is_mounted:
+            return
+        icons = {"queued": "…", "running": "▶", "done": "✓",
+                 "error": "✗", "cancelled": "⧉"}
+        key = self._rows.get(module)
+        if key is None:
+            return
+        try:
+            table = self.query_one("#module-status", DataTable)
+            table.update_cell(key, "Status", f"{icons.get(status, '?')} {status}")
+        except Exception:
+            pass
+
+    def _log(self, module: str, message: str) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#activity-log", RichLog).write(
+                f"[cyan]{module:<8}[/cyan] {message}"
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    @work(thread=True, exclusive=True)
+    def start_scan(self) -> None:
+        cfg: Config = self.app.config  # type: ignore[attr-defined]
+        target: str = self.app.target  # type: ignore[attr-defined]
+        try:
+            out = cfg.output_path()
+            audit_path = out / "audit.log"
+
+            def on_status(module, status):
+                self.app.call_from_thread(self._set_status, module, status)
+
+            def on_log(module, message):
+                self.app.call_from_thread(self._log, module, message)
+
+            def on_finding(finding: Finding):
+                def bump():
+                    self._count += 1
+                    self._update_counter()
+                self.app.call_from_thread(bump)
+
+            self.engine = Engine(
+                target, cfg,
+                on_log=on_log, on_finding=on_finding, on_status=on_status,
+                audit_path=audit_path,
+            )
+            result = self.engine.run()
+            # Save reports and deliver on the worker thread so blocking network
+            # I/O never freezes the UI event loop.
+            saved_msg, deliver_msg = self._save_and_deliver(cfg, result)
+        except Exception as exc:
+            # Never let a worker exception crash the whole TUI with a traceback;
+            # surface it and return to the welcome screen.
+            self.app.call_from_thread(self._scan_failed, exc)
+            return
+        self.app.call_from_thread(self._finished, result, saved_msg, deliver_msg)
+
+    def _save_and_deliver(self, cfg, result: ScanResult):
+        from allscan.main import write_outputs
+
+        saved_msg, deliver_msg = "", None
+        try:
+            paths = write_outputs(result, cfg, json_only=False)
+            saved_msg = f"Saved {len(paths)} report file(s): " + ", ".join(p.name for p in paths)
+        except Exception as exc:
+            paths = []
+            saved_msg = f"Could not save reports: {exc}"
+        if getattr(cfg, "discord_webhook", None):
+            try:
+                from allscan import notify
+                deliver_msg = notify.deliver(result, cfg, paths)
+            except Exception as exc:
+                deliver_msg = f"Discord delivery error: {exc}"
+        return saved_msg, deliver_msg
+
+    def _scan_failed(self, exc: Exception) -> None:
+        self.notify(f"Scan could not start: {exc}", severity="error", timeout=10)
+        if self.is_mounted:
+            try:
+                self._log("tui", f"ERROR: {exc}")
+            except Exception:
+                pass
+        self.app.switch_screen(WelcomeScreen())
+
+    def _finished(self, result: ScanResult, saved_msg: str = "",
+                  deliver_msg: Optional[str] = None) -> None:
+        self.app.last_result = result  # type: ignore[attr-defined]
+        if saved_msg:
+            self.notify(saved_msg, severity="information"
+                        if "Could not" not in saved_msg else "error", timeout=6)
+        if deliver_msg:
+            self.notify(deliver_msg, severity="error" if "failed" in deliver_msg.lower()
+                        or "error" in deliver_msg.lower() else "information", timeout=8)
+        # keep a save-failure visible on the results screen, not just as a toast
+        status = deliver_msg
+        if saved_msg.startswith("Could not"):
+            status = saved_msg + (f"   |   {deliver_msg}" if deliver_msg else "")
+        self.app.switch_screen(ResultsScreen(result, status))
+
+    def action_stop(self) -> None:
+        if self.engine and not self._stopped:
+            self._stopped = True
+            self._update_counter()
+            self._log("tui", "Stop requested — finishing current step, saving partial results…")
+            self.engine.request_cancel()
+
+
+# --------------------------------------------------------------------------- #
+# Results
+# --------------------------------------------------------------------------- #
+
+
+class ResultsScreen(Screen):
+    BINDINGS = [
+        Binding("j", "export_json", "Export JSON"),
+        Binding("m", "export_md", "Export MD"),
+        Binding("h", "export_html", "Export HTML"),
+        Binding("r", "rescan", "New scan"),
+        Binding("p", "past_scans", "Past scans"),
+        Binding("escape", "app.quit", "Quit"),
+    ]
+
+    def __init__(self, result: ScanResult, deliver_msg: Optional[str] = None) -> None:
+        super().__init__()
+        self.result = result
+        self.deliver_msg = deliver_msg
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        counts = self.result.counts_by_severity()
+        partial = " [red](partial — cancelled)[/red]" if self.result.partial else ""
+        summary = "  ".join(
+            f"[{SEVERITY_COLOR[s]}]{s.upper()}: {counts[s]}[/]"
+            for s in ("high", "medium", "low", "info")
+        )
+        with Vertical(id="results-box"):
+            yield Static(
+                f"[b]Results — {self.result.target}[/b]{partial}  "
+                f"[dim]{self.result.duration:.1f}s[/dim]",
+                id="results-title",
+            )
+            yield Static(summary, id="results-summary")
+            if self.deliver_msg:
+                color = "red" if ("failed" in self.deliver_msg.lower()
+                                  or "error" in self.deliver_msg.lower()) else "green"
+                yield Static(f"[{color}]{self.deliver_msg}[/]", id="deliver-status")
+            yield Static("[dim]keys: j=JSON m=Markdown h=HTML r=new scan "
+                         "p=past scans esc=quit[/dim]")
+            yield DataTable(id="findings-table", zebra_stripes=True, cursor_type="row")
+            yield Static("", id="finding-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        table.add_columns("Severity", "Category", "Target", "Finding")
+        grouped = self.result.by_category()
+        self._lookup: dict = {}
+        # sort categories, then findings by severity within
+        findings_sorted = sorted(
+            self.result.findings,
+            key=lambda f: (-f.severity.rank, f.category, f.title),
+        )
+        if not findings_sorted:
+            self.query_one("#finding-detail", Static).update(
+                "[dim]No findings recorded.[/dim]"
+            )
+        for f in findings_sorted:
+            sev = f.severity.value
+            key = table.add_row(
+                f"[{SEVERITY_COLOR[sev]}]{sev.upper()}[/]",
+                f.category,
+                (f.target[:28] + "…") if len(f.target) > 29 else f.target,
+                f.title[:70],
+            )
+            self._lookup[key] = f
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        f = self._lookup.get(event.row_key)
+        if not f:
+            return
+        import json as _json
+        detail = (
+            f"[b]{f.title}[/b]\n"
+            f"[{SEVERITY_COLOR[f.severity.value]}]{f.severity.value.upper()}[/] · "
+            f"{f.category} · module={f.module} · target={f.target}\n\n"
+            f"{f.description}\n"
+        )
+        if f.evidence:
+            detail += "\n[dim]evidence:[/dim]\n" + _json.dumps(f.evidence, indent=2, default=str)
+        self.query_one("#finding-detail", Static).update(detail)
+
+    # exports
+    def _export(self, kind: str) -> None:
+        from allscan import report
+        out = Path(self.app.config.output_dir)  # type: ignore[attr-defined]
+        try:
+            if kind == "json":
+                path = report.save_json(self.result, out)
+            elif kind == "md":
+                path = report.save_markdown(self.result, out)
+            else:
+                path = report.save_html(self.result, out)
+            self.notify(f"Exported: {path}")
+        except Exception as exc:
+            self.notify(f"Export failed: {exc}", severity="error")
+
+    def action_export_json(self) -> None:
+        self._export("json")
+
+    def action_export_md(self) -> None:
+        self._export("md")
+
+    def action_export_html(self) -> None:
+        self._export("html")
+
+    def action_rescan(self) -> None:
+        self.app.switch_screen(WelcomeScreen())
+
+    def action_past_scans(self) -> None:
+        self.app.push_screen(PastScansScreen())
+
+
+# --------------------------------------------------------------------------- #
+# Past scans + diff
+# --------------------------------------------------------------------------- #
+
+
+class PastScansScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("enter", "view", "View"),
+        Binding("d", "diff", "Diff selected"),
+        Binding("space", "mark", "Mark for diff"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._marked: list = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="past-box"):
+            yield Static("[b]Past scans[/b]  "
+                         "[dim](enter=view · space=mark two · d=diff marked · esc=back)[/dim]")
+            yield DataTable(id="runs-table", zebra_stripes=True, cursor_type="row")
+            yield Static("", id="past-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        from allscan import report
+        table = self.query_one("#runs-table", DataTable)
+        table.add_columns("", "When", "Target", "Findings", "File")
+        out = Path(self.app.config.output_dir)  # type: ignore[attr-defined]
+        self._runs = report.list_runs(out)
+        self._row_to_run: dict = {}
+        if not self._runs:
+            self.query_one("#past-status", Static).update(
+                f"[dim]No past runs in {out}/[/dim]"
+            )
+        for r in self._runs:
+            key = table.add_row("", r.when, r.target, str(r.finding_count), r.path.name)
+            self._row_to_run[key] = r
+
+    def _current_run(self):
+        table = self.query_one("#runs-table", DataTable)
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        return self._row_to_run.get(key), key
+
+    def action_view(self) -> None:
+        from allscan import report
+        cur = self._current_run()
+        if not cur or cur[0] is None:
+            return
+        run = cur[0]
+        try:
+            result = report.load_json(run.path)
+        except Exception as exc:
+            self.notify(f"Could not load run: {exc}", severity="error")
+            return
+        self.app.push_screen(ResultsScreen(result))
+
+    def action_mark(self) -> None:
+        cur = self._current_run()
+        if not cur or cur[0] is None:
+            return
+        run, key = cur
+        table = self.query_one("#runs-table", DataTable)
+        if run in self._marked:
+            self._marked.remove(run)
+            table.update_cell(key, "", "")
+        else:
+            if len(self._marked) >= 2:
+                oldest = self._marked.pop(0)
+                for k, r in self._row_to_run.items():
+                    if r is oldest:
+                        table.update_cell(k, "", "")
+            self._marked.append(run)
+            table.update_cell(key, "", "✓")
+        self.query_one("#past-status", Static).update(
+            f"[dim]marked {len(self._marked)}/2 for diff[/dim]"
+        )
+
+    def action_diff(self) -> None:
+        if len(self._marked) != 2:
+            self.notify("Mark exactly two runs (space) to diff.", severity="warning")
+            return
+        if self._marked[0].target != self._marked[1].target:
+            self.notify("Diff requires two runs of the same target.", severity="error")
+            return
+        # order by time: older first
+        a, b = sorted(self._marked, key=lambda r: r.started_at)
+        self.app.push_screen(DiffScreen(a.path, b.path))
+
+
+class DiffScreen(Screen):
+    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
+
+    def __init__(self, old_path: Path, new_path: Path) -> None:
+        super().__init__()
+        self.old_path = old_path
+        self.new_path = new_path
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with VerticalScroll(id="diff-box"):
+            yield Static("", id="diff-title")
+            yield DataTable(id="diff-table", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        from allscan import report
+        old = report.load_json(self.old_path)
+        new = report.load_json(self.new_path)
+        d = report.diff_runs(old, new)
+        self.query_one("#diff-title", Static).update(
+            f"[b]Diff — {d.target}[/b]  "
+            f"[green]+{len(d.added)} new[/green]  "
+            f"[red]-{len(d.removed)} resolved[/red]  "
+            f"[dim]{len(d.unchanged)} unchanged[/dim]\n"
+            f"[dim]{self.old_path.name}  →  {self.new_path.name}[/dim]"
+        )
+        table = self.query_one("#diff-table", DataTable)
+        table.add_columns("Change", "Severity", "Category", "Finding")
+        for f in d.added:
+            table.add_row("[green]NEW[/green]",
+                          f"[{SEVERITY_COLOR[f.severity.value]}]{f.severity.value.upper()}[/]",
+                          f.category, f.title[:70])
+        for f in d.removed:
+            table.add_row("[red]GONE[/red]",
+                          f"[{SEVERITY_COLOR[f.severity.value]}]{f.severity.value.upper()}[/]",
+                          f.category, f.title[:70])
+        if not d.added and not d.removed:
+            table.add_row("—", "—", "—", "No differences")
+
+
+# --------------------------------------------------------------------------- #
+# App
+# --------------------------------------------------------------------------- #
+
+
+class AllscanApp(App):
+    CSS = """
+    Screen { align: center top; background: $background; }
+    #welcome-box {
+        width: 90%; max-width: 120; margin: 1 2; padding: 1 2;
+        border: heavy #22d3ee; background: $panel;
+    }
+    #modules-box, #settings-box, #scan-box, #results-box,
+    #past-box, #diff-box {
+        width: 90%;
+        max-width: 120;
+        margin: 1 2;
+        padding: 1 2;
+        border: round $primary;
+    }
+    #modules-box { border: round #a78bfa; }
+    #settings-box { border: round #fb923c; }
+    #scan-box { border: round #4ade80; }
+    #results-box { border: round #22d3ee; }
+    #past-box { border: round #facc15; }
+    #diff-box { border: round #f472b6; }
+    #banner { height: auto; content-align: center middle; text-align: center; }
+    #credit { text-align: center; margin-bottom: 1; }
+    #title { text-align: center; text-style: bold; }
+    #subtitle { text-align: center; margin-bottom: 1; }
+    #menu-bar {
+        margin-bottom: 1; padding: 1 2; content-align: center middle;
+        text-align: center;
+        background: $boost; border: heavy #4ade80;
+    }
+    #target-input { margin: 1 0; border: tall #38bdf8; }
+    #target-input:focus { border: tall #22d3ee; }
+    #target-error { color: red; text-align: center; }
+    #welcome-buttons, #modules-buttons, #settings-buttons {
+        margin-top: 1; align: center middle;
+    }
+    Button { margin: 0 1; }
+    .setting-row { height: 3; align: left middle; }
+    .setting-label { width: 44; color: #7dd3fc; }
+    #module-list { height: 12; border: round #a78bfa; }
+    #scan-top { height: 12; }
+    #module-status { width: 60%; }
+    #counter-panel {
+        width: 40%; content-align: center middle; text-align: center;
+        border: heavy #4ade80; color: #4ade80;
+    }
+    #activity-log { height: 1fr; border: round #38bdf8; }
+    #findings-table { height: 1fr; }
+    #finding-detail {
+        height: 14; border: round #facc15; padding: 0 1; overflow-y: auto;
+    }
+    #runs-table, #diff-table { height: 1fr; }
+    """
+
+    TITLE = "allscan"
+    SUB_TITLE = f"authorized security recon · {CREDIT}"
+
+    def __init__(self, initial_target: Optional[str], config: Config) -> None:
+        super().__init__()
+        self.config = config
+        self.pending_target = initial_target
+        self.target: Optional[str] = None
+        self.authorized = False
+        self.last_result: Optional[ScanResult] = None
+
+    def on_mount(self) -> None:
+        self.push_screen(WelcomeScreen())
+
+
+def run_tui(initial_target: Optional[str] = None, config: Optional[Config] = None) -> int:
+    config = config or Config.load()
+    app = AllscanApp(initial_target=initial_target, config=config)
+    app.run()
+    return 0

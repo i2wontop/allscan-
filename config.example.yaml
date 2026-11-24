@@ -1,0 +1,123 @@
+# allscan configuration (copy to config.yaml, or pass with --config)
+# Every key is optional; omitted keys fall back to built-in defaults.
+# CLI flags and the TUI settings screen override anything set here.
+
+# Concurrency / politeness --------------------------------------------------
+threads: 20            # concurrent workers for DNS/port/web tasks
+rate_limit: 10.0       # global cap on requests/second against the target (0 = unlimited)
+timeout: 8.0           # per-network-operation timeout, seconds
+
+# Port scanning -------------------------------------------------------------
+full_ports: false      # true -> scan all 65535 ports (slow)
+top_ports: 1000        # nmap --top-ports when not scanning the full range
+skip_nmap: false       # true -> never call nmap; use the built-in connect scanner
+os_detection: false    # nmap -O (requires root/Administrator)
+scan_intensity: normal # normal | aggressive (deeper version/banner probing + TLS inspection)
+scan_scripts: false    # run nmap safe default scripts (-sC)
+udp_scan: false        # also sweep top UDP ports with nmap (-sU, requires root)
+extra_ports: []        # extra TCP ports the built-in scanner always probes, e.g. [7001, 9043]
+
+# Modules to run by default (TUI/CLI can narrow this) -----------------------
+modules:
+  - netdiscover        # ICMP ping sweep (CIDR), ARP neighbours, traceroute
+  - recon              # subdomain & asset discovery
+  - dnsx               # DNS deep-dive: SOA/SRV/CAA/DNSKEY, DNSSEC, cache snoop
+  - whois              # WHOIS / RDAP registration data (domain + IP netblocks)
+  - asn                # ASN / IP-range / BGP prefix attribution (Team Cymru)
+  - certs              # certificate + CT-log discovery and new-cert monitoring
+  - email              # SPF / DKIM / DMARC posture
+  - scan               # port/service scan
+  - web                # web enumeration & content discovery
+  - fingerprint        # API endpoints, CMS + version, framework detection
+  - headers            # HTML source + security header analysis
+  - tls                # SSL/TLS deep audit: protocol matrix, chain, expiry
+  - cloud              # exposed cloud buckets + metadata-endpoint references
+  - waf                # WAF/CDN fingerprint + rate-limit observation
+  - integrations       # external scanner wrappers (no-op unless `integrations:` set)
+  - active             # active probing (detection-only; no-op unless `active: true`)
+  - vulns              # informational CVE correlation + misconfigs
+  - exploitrefs        # exploit references + KEV/EPSS enrichment (no payloads)
+  - vulnintel          # CPE, vuln-age, business-impact scoring, FP suppression
+  - surface            # attack-surface + infra-relationship roll-up
+  - threatmodel        # ATT&CK / STRIDE / compliance mapping + risk matrix
+  - compliance         # baseline pass/fail checklist roll-up (runs last)
+
+# Network/host discovery ----------------------------------------------------
+host_discovery_cidr: null   # explicit CIDR for the ping sweep; null -> /24 of target IP
+host_discovery_max: 256     # cap on hosts swept per run
+
+# Active probing (detection-only) -------------------------------------------
+# Active checks SEND requests to CONFIRM weaknesses with benign markers — they
+# never exploit, extract data or alter state. All of this is off by default and
+# additionally requires the authorization gate + the --active flag / TUI toggle.
+active: false                 # master switch (equivalent to --active)
+scope_allow: []               # extra in-scope hosts/domains/CIDRs, e.g. ["api.example.com", "10.0.0.0/24"]
+scope_deny: []                # always-blocked hosts/domains/CIDRs (denylist wins)
+allow_production: false       # acknowledge a production target and silence the warning
+active_max_concurrency: 8     # active-only worker cap (also bounded by `threads`)
+active_max_urls: 25           # cap probed URLs per run
+active_max_params: 6          # cap probed parameters per URL
+active_stop_after_errors: 25  # auto-stop active probing after N consecutive request errors
+
+# External scanner integrations (opt-in; only run if the binary is installed).
+# Passive: subfinder, amass, httpx. Active (also need active: true): nuclei,
+# nikto, sqlmap (detection phase only), masscan. allscan never installs tools.
+integrations: []              # e.g. [subfinder, httpx, nuclei]
+
+# Output --------------------------------------------------------------------
+output_dir: allscan-results   # JSON/MD/HTML reports + audit.log land here
+follow_redirects: true
+verify_tls: false      # recon routinely hits self-signed hosts; off by default
+
+# Wordlists (null -> use the small built-in lists) --------------------------
+wordlist_subdomains: null     # e.g. /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+wordlist_web: null            # e.g. /usr/share/seclists/Discovery/Web-Content/common.txt
+max_subdomains_bruteforce: 2000
+
+# DNS -----------------------------------------------------------------------
+dns_resolvers:
+  - 1.1.1.1
+  - 8.8.8.8
+  - 9.9.9.9
+
+# CVE correlation -----------------------------------------------------------
+# An NVD API key raises your rate limit from ~5 to ~50 requests/30s.
+# Request one free at https://nvd.nist.gov/developers/request-an-api-key
+nvd_api_key: null
+
+# CVE data sources to query (any of: nvd, circl). Results are merged + deduped.
+cve_sources: [nvd, circl]
+
+# Business-impact risk scoring (severity x likelihood x asset criticality) ---
+default_criticality: medium   # when an asset isn't listed below
+asset_criticality: {}         # e.g. {api.example.com: critical, blog.example.com: low}
+suppress_fingerprints: []     # finding fingerprints to mark false-positive (see `findings list`)
+
+# Exploit-reference enrichment -----------------------------------------------
+# Optional local ExploitDB checkout CSV to resolve concrete EDB-IDs offline.
+# References/intel only — allscan never downloads, embeds or runs exploit code.
+#   e.g. /opt/exploitdb/files_exploits.csv
+exploitdb_csv: null
+
+# Reporting ------------------------------------------------------------------
+pdf: false                    # also emit a ReportLab PDF (exec summary + risk table)
+
+# Engagement projects --------------------------------------------------------
+projects_dir: allscan-projects   # where `allscan project ...` stores engagements
+
+# Delivery -------------------------------------------------------------------
+# Send the JSON + HTML reports to a Discord webhook when a scan finishes.
+# Can also be entered in the TUI settings screen or via --discord-webhook.
+discord_webhook: null            # e.g. https://discord.com/api/webhooks/<id>/<token>
+
+# Identification ------------------------------------------------------------
+user_agent: "allscan/1.0 (authorized security testing)"
+
+# Outbound HTTP (proxy / headers / authenticated scanning) -------------------
+# Cookies, auth and custom header VALUES are only ever sent to in-scope hosts
+# (target + scope_allow, minus scope_deny) — never to enrichment endpoints.
+proxy: null                   # e.g. http://127.0.0.1:8080 (Burp) or socks5://127.0.0.1:9050 (Tor)
+extra_headers: {}             # e.g. {X-Bug-Bounty: handle}
+cookie: null                  # e.g. "session=abc; csrf=def"
+auth_bearer: null             # bearer token (Authorization: Bearer ...)
+auth_basic: null              # user:pass (Authorization: Basic ...)

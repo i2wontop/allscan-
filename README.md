@@ -1,1 +1,519 @@
-# allscan-
+# allscan
+
+A modular security reconnaissance / scanning tool with an interactive
+**terminal UI** (built on [`rich`](https://github.com/Textualize/rich) and
+[`textual`](https://github.com/Textualize/textual)) and a scriptable CLI, for
+**authorized** security testing.
+
+allscan ties together passive & active subdomain discovery, port/service
+scanning, web enumeration, HTML/header/TLS analysis, and informational CVE
+correlation — then presents everything as severity-ranked findings you can
+browse, export (JSON / Markdown / HTML), and diff against previous runs.
+
+> ⚠️ **Authorized use only.** Scanning systems you do not own or do not have
+> explicit written permission to test may be illegal. allscan **refuses to
+> run** until authorization is confirmed (an interactive prompt in the TUI, or
+> the `--i-have-authorization` flag for automation). It rate-limits all
+> activity and writes a full audit log of every outbound action.
+
+---
+
+## Features
+
+| Module | What it does |
+| --- | --- |
+| **Network/Host Discovery** (`netdiscover`) | ICMP ping sweep across a CIDR (defaults to the /24 of the resolved target), read-only ARP neighbour listing, and traceroute hop listing. Shells out to standard tools and degrades gracefully when ICMP/raw sockets are unavailable. |
+| **Subdomain Discovery** (`recon`) | Passive: crt.sh certificate transparency, DNS records (A/AAAA/MX/TXT/NS/CNAME/SOA), reverse PTR. Active: async wordlist brute force, AXFR zone-transfer attempts. Flags wildcard DNS and filters its noise. |
+| **DNS Deep-Dive** (`dnsx`) | Full record dump (SOA, NS, CAA, DNSKEY, DS, TXT, SRV service probes), DNSSEC presence/validation check (DNSKEY + AD flag), and informational DNS cache-snooping detection. Flags missing CAA and unsigned zones. |
+| **WHOIS / RDAP** (`whois`) | RDAP (structured) registration lookup for the domain and resolved IP netblocks, with a WHOIS port-43 fallback. Registrar, key dates, status, name servers, netblock org; flags expiring and recently-registered domains. |
+| **ASN / IP-range Discovery** (`asn`) | Maps every resolved IP to its origin ASN, announced BGP prefix, registry and owning org (Team Cymru DNS service — no API key), and groups hosts by ASN/netblock (target vs. third-party). Prefixes feed the host-discovery sweep. |
+| **Certificate / CT-log Discovery** (`certs`) | Collects certs for the domain from Certificate Transparency (crt.sh): issuers, validity, all SAN names (→ more subdomains), wildcard usage. **CT monitoring:** saves a baseline and, on later runs, flags newly-issued certificates (shadow-infra / unauthorized-issuance early warning). |
+| **Attack-Surface Mapping** (`surface`) | Correlates subdomains ↔ IPs ↔ ASNs ↔ ports/services ↔ web/tech ↔ cloud into a node/edge relationship map (in the JSON for a future topology view). Flags third-party-hosted assets and hostnames with no observed service (dangling DNS). |
+| **Email Security** (`email`) | SPF, DKIM (common-selector probe) and DMARC presence + basic validity. Flags missing records, permissive SPF (`+all`/`?all`) and monitor-only DMARC (`p=none`). |
+| **Port/Service Scan** (`scan`) | Wraps `nmap` (top-1000 by default, full 65535 optional, `-sV` version detection, optional `-O` OS detection). Falls back to a built-in concurrent connect scanner + banner grabber when nmap is unavailable or skipped. Flags sensitive exposed services (Redis, Mongo, Docker API, …). |
+| **Web Enumeration** (`web`) | HTTP/HTTPS probing of every discovered host (status, title, tech fingerprint), plus content brute forcing for sensitive paths (`.git/`, `.env`, backups, config files, actuators, admin panels) and directory-listing detection. |
+| **API & Tech Fingerprinting** (`fingerprint`) | Probes common API/doc endpoints (`/api`, `/graphql`, swagger/openapi), CMS detection with version (WordPress, Drupal, Joomla, Magento, …), and server-side framework / front-end library fingerprinting. Version-bearing hits feed CVE correlation. |
+| **HTML/Header Analysis** (`headers`) | Security-header audit (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy), verbose-header and cookie-flag checks, and HTML source analysis (exposed comments, credential-shaped strings, internal paths, outdated JS libraries, risky inline JS). |
+| **SSL/TLS Deep Audit** (`tls`) | Protocol support matrix (SSLv3 / TLS 1.0–1.3 accepted?), full certificate-chain validation against the system trust store, and certificate-expiry warnings. Flags deprecated protocols. |
+| **Cloud Exposure** (`cloud`) | Detects cloud-storage bucket references (S3, Azure Blob, GCS) in subdomains/HTML and classifies each as publicly listable / private / absent with a single bucket-root request (no object access). Flags cloud metadata-endpoint references (SSRF sinks) — reference only, never probed. |
+| **WAF/CDN & Rate-limit Detection** (`waf`) | Fingerprints WAFs/CDNs (Cloudflare, Akamai, CloudFront, Fastly, Sucuri, Imperva, F5, ModSecurity, …) from headers/cookies, and observes rate-limiting (HTTP 429) over a small, bounded request burst. |
+| **Active Probing** (`active`) | *Opt-in (`--active`), detection-only.* Sends benign-marker requests to **confirm** weaknesses — reflected input (XSS sink), open redirect, error-based SQL-injection signature, confirmed directory listing, **permissive CORS, host-header reflection**, and **JWT analysis** (decode-only: flags `alg=none`/weak alg) — never to exploit. Scope-enforced, rate-limited, concurrency-capped, with a kill switch and auto-stop. Each finding: `{type, location, severity, evidence, confidence, note:"manual validation required"}`. |
+| **Scanner Integrations** (`integrations`) | *Opt-in (`--integrations …`).* Wraps external tools **if installed** and folds their output into the finding model: `subfinder`/`amass`/`httpx` (passive) and `nuclei`/`nikto`/`sqlmap`/`masscan` (active — also require `--active` and pass the scope guard). `sqlmap` runs its **detection phase only** (`--batch`, no `--dump`/`--os-*`). allscan never installs tools or runs an exploitation mode. |
+| **CVE Correlation** (`vulns`) | Matches detected service/library versions against the **NVD** and **CIRCL CVE Search** APIs (merged + deduped) and lists known CVEs with CVSS severity — *informational listing only, no PoC or exploit code*. Also flags common misconfigs (anonymous FTP, directory listing, sensitive open ports). |
+| **Vuln Intelligence & Risk Scoring** (`vulnintel`) | Finishes the vuln-intel picture: derives a **CPE 2.3** string per versioned service/CVE, **ages** each CVE (flagging old + KEV/high), and computes a **business-impact risk score** (0–100 + band) from severity × likelihood × **asset criticality** (`--criticality` / `--asset-criticality`). Honours a **false-positive suppression** list (`--suppress`). Produces a Top-Risks roll-up in the report. |
+| **Exploit-Reference Enrichment** (`exploitrefs`) | For each correlated CVE, adds decision-useful **references and risk signals**: CISA **KEV** (exploited-in-the-wild) status, **EPSS** score/percentile, and ExploitDB / Metasploit reference links (plus concrete EDB-IDs when pointed at a local ExploitDB `files_exploits.csv`). *References and intelligence only — no exploit code is downloaded, embedded, or run, and no exploitation is performed.* |
+| **Threat Model & Compliance Mapping** (`threatmodel`) | Rolls findings up into a **risk matrix** (severity × likelihood, where likelihood is raised by KEV / high EPSS / active confirmation), a **MITRE ATT&CK** technique spread, a **STRIDE** category spread, and the **OWASP / CWE / NIST / CIS / PCI** references touched. Rendered as report sections; the data is in the JSON. |
+| **Compliance Checklist** (`compliance`) | Runs last and rolls up all findings into a pass/fail/warn checklist against common baselines (OWASP Secure Headers, basic TLS hygiene, email auth, DNS hygiene, exposure hygiene). Rendered as a dedicated section in the report. |
+| **Reporting** (`report`) | Structured JSON per run, auto-generated Markdown & HTML summaries (severity-tagged, colour-coded, with the compliance checklist, **risk matrix**, **ATT&CK/STRIDE/compliance mapping**, and an **attack-surface topology diagram** rendered as inline SVG), a standalone topology `.svg`, an optional PDF, and a diff mode comparing two runs. |
+
+All modules are **detection-only**: they identify and report issues and never
+exploit them — no bucket writes, no auth bypass, no SSRF probing, no access of
+discovered credentials or endpoints. The authorization gate applies to every
+module.
+
+Every finding carries a category, a severity (`info` / `low` / `medium` /
+`high`), a target, a description, and structured evidence.
+
+---
+
+## Scan intensity
+
+`--intensity {standard,deep,max}` (TUI: Settings → *Intensity*; config key
+`intensity`) controls how hard the vulnerability checks look. Every level is
+still **detection-only**, scope-enforced, rate-limited and gated behind
+`--active` + the authorization prompt — higher levels widen coverage, they never
+exploit anything.
+
+| Level | URLs / params per URL | Extra checks |
+| --- | --- | --- |
+| `standard` (default) | 25 / 6 | Reflection, open redirect, error-based SQLi, dir listing, CORS, host-header, JWT |
+| `deep` | 75 / 12 | + HTTP-method exposure (`OPTIONS` list, `TRACE` echo), template-expression eval (`{{7*7}}`), CR/LF response splitting, boolean-differential SQLi, verbose-error disclosure, unescaped-metacharacter reflection, ~30 extra sensitive paths, 50 CVEs per product |
+| `max` | 200 / 25 | + file-path-handling influence (non-existent paths only), 100 CVEs per product |
+
+Deep/max checks use inert markers only (no PUT/DELETE, no UNION/stacked SQL, no
+data extraction, no real system files). `tests/demo_vuln_app.py` is a
+deliberately vulnerable localhost-only app you can scan to see the difference:
+
+```bash
+python tests/demo_vuln_app.py 80 &        # needs port 80/443 (targets are host-only)
+allscan 127.0.0.1 --no-tui --i-have-authorization --active --intensity max \
+        --modules scan,web,headers,active --skip-nmap --allow-production
+```
+
+The TUI, CLI banner and menu launcher all carry the attribution
+**Made by @i2w / 1337 Group**.
+
+---
+
+## Install
+
+```bash
+# from the project root
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # or: pip install -e .
+
+# optional but recommended for the port scanner:
+sudo apt install nmap                     # Debian/Ubuntu
+brew install nmap                         # macOS
+```
+
+Python 3.9+ is required. If `nmap` is absent, allscan automatically uses its
+built-in connect/banner scanner.
+
+### Windows .exe (no Python needed)
+
+Grab `allscan.exe` from the latest release and double-click it — it opens the
+terminal UI straight on the welcome screen. One file, no Python/venv/pip.
+
+`nmap` and the optional scanners (subfinder/nuclei/…) are not bundled; the exe
+uses the built-in scanner when `nmap` is absent and picks up any of those tools
+if they're on PATH. The authorization gate and audit logging work the same as
+from source.
+
+Build it yourself (PyInstaller can't cross-compile, so build on Windows):
+
+```powershell
+pip install -r requirements.txt pyinstaller
+python packaging/build.py          # -> dist/allscan.exe
+```
+
+The release CI job (`.github/workflows/release-windows.yml`) builds the one-file
+exe on `windows-latest` for each tag/release and uploads it as a release asset.
+
+---
+
+## Usage
+
+### Interactive TUI
+
+Launch with no target (or with a target to pre-fill the prompt):
+
+```bash
+allscan                 # or: python -m allscan
+allscan example.com     # pre-fills the target field
+```
+
+### Headless / scripting
+
+Mirror every TUI option as a flag. Authorization must be confirmed explicitly:
+
+```bash
+# run everything (equivalent to the TUI's Allscan option):
+allscan example.com --i-have-authorization --all
+
+allscan example.com --i-have-authorization \
+    --modules recon,scan,web,headers,vulns \
+    --threads 20 --rate-limit 10 \
+    --output-dir ./results
+
+# a fast web-only pass, skipping nmap:
+allscan 203.0.113.10 --i-have-authorization --modules web,headers --skip-nmap
+
+# full port range + OS detection (needs root for -O):
+sudo allscan example.com --i-have-authorization --full-ports --os-detection
+
+# full chain minus a couple of modules, with a PDF report:
+allscan example.com --i-have-authorization --all --skip-active --skip web --pdf
+
+# many targets from a file (host/IP/CIDR per line): per-target reports + aggregate
+allscan --targets-file scope.txt --i-have-authorization --all
+```
+
+Management subcommands:
+
+```bash
+allscan list --output-dir ./results           # list past runs
+allscan diff OLD_RUN.json NEW_RUN.json         # diff two saved runs
+```
+
+### CLI flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--domain` / `--ip` / positional | Target (domain or IP) |
+| `--targets-file FILE` | Run the chain per line (host/IP/CIDR); per-target reports + aggregate |
+| `--all` | Run every module with defaults |
+| `--modules a,b,c` | Which modules to run (default: all) |
+| `--skip m1,m2` / `--skip-web` / `--skip-scan` … | Drop modules from the full chain / `--all` |
+| `--cve-source nvd,circl` | CVE data sources to query |
+| `--exploitdb-csv FILE` | Local ExploitDB CSV for concrete EDB-ID references |
+| `--pdf` | Also write a PDF report (needs `reportlab`) |
+| `--full-ports` | Scan all 65535 ports |
+| `--skip-nmap` | Use the built-in scanner instead of nmap |
+| `--os-detection` | nmap `-O` OS detection (needs root) |
+| `--threads N` | Concurrent workers |
+| `--rate-limit R` | Max requests/second against the target (`0` = unlimited) |
+| `--timeout S` | Per-request timeout |
+| `--output-dir DIR` | Where reports + `audit.log` are written |
+| `--config FILE` | YAML config file (see `config.example.yaml`) |
+| `--wordlist-subdomains` / `--wordlist-web` | Custom wordlists |
+| `--nvd-api-key` | NVD API key for higher CVE rate limits |
+| `--i-have-authorization` | **Required** to run headless |
+| `--no-tui` / `--json-only` | Force headless / write JSON only |
+| `--active` | Enable **active probing** (detection-only; sends requests) |
+| `--scope-allow HOSTS` | Comma-separated extra in-scope hosts/domains/CIDRs |
+| `--scope-deny HOSTS` | Comma-separated always-blocked hosts/domains/CIDRs (wins) |
+| `--allow-production` | Acknowledge a production target, silence the warning |
+| `--active-max-concurrency N` | Active-only worker cap (default 8) |
+| `--active-stop-after-errors N` | Auto-stop active probing after N consecutive errors |
+| `--integrations t1,t2` | Wrap installed scanners: subfinder,amass,httpx (passive); nuclei,nikto,sqlmap,masscan (active) |
+| `--discord-webhook URL` | Send the JSON + HTML reports to this Discord webhook on completion |
+| `--proxy URL` | Route all outbound HTTP through a proxy (http/https/socks5) |
+| `--user-agent STR` | Override the default User-Agent |
+| `--header 'Name: Value'` | Extra request header (repeatable); in-scope hosts only |
+| `--cookie STR` / `--auth-bearer TOKEN` / `--auth-basic user:pass` | Authenticated scanning; in-scope hosts only |
+
+Configuration precedence: built-in defaults → YAML config → CLI flags / TUI.
+
+---
+
+## Proxy, custom headers & authenticated scanning
+
+All outbound HTTP can be routed through a proxy and carry custom headers / auth,
+applied consistently across every module:
+
+```bash
+# through Burp, with a program header and a session cookie
+allscan app.example.com --i-have-authorization --all --active \
+    --proxy http://127.0.0.1:8080 --header "X-Bug-Bounty: handle" \
+    --cookie "session=…" --scope-allow app.example.com
+```
+
+The User-Agent override and the proxy apply to every request. **Cookies, auth
+(`--auth-bearer` / `--auth-basic`) and custom header values are only ever sent to
+in-scope hosts** (target + `--scope-allow`, minus `--scope-deny`) — never to
+enrichment endpoints like crt.sh, NVD, CIRCL or Discord. These values are
+secrets: they are never written to the audit log. (SOCKS proxies need the
+`requests[socks]` extra, included in `requirements.txt`.)
+
+## Discord delivery
+
+Have each finished scan's **JSON + HTML** reports posted to a Discord webhook:
+an embed titled `All Scan v<version>` with one field per module (and its finding
+breakdown) and the two report files attached. Set it in the TUI settings screen
+(the field is masked), via `--discord-webhook`, or in config:
+
+```bash
+allscan example.com --i-have-authorization --all \
+    --discord-webhook "https://discord.com/api/webhooks/<id>/<token>"
+
+# verify a webhook independently (sends a sample report):
+allscan test-webhook "https://discord.com/api/webhooks/<id>/<token>"
+```
+
+Delivery is resilient: the summary embed is sent even when a report is missing
+or exceeds Discord's 8 MiB attachment limit (the files are then skipped or
+regenerated), so the notification is never lost.
+
+The webhook is treated as a secret (never written to the audit log or printed
+back); reports are always saved locally regardless of delivery success.
+
+---
+
+## Engagement projects & workflow
+
+A local, file-based engagement layer (no server) stores a project with its
+scope, rules-of-engagement, testing window and **authorization evidence**, then
+tracks findings and retests across runs.
+
+```bash
+# create an engagement (store authorization evidence up front)
+allscan project create acme --client "ACME Inc" \
+    --scope-allow "app.acme.test,10.0.0.0/24" --scope-deny "prod.acme.test" \
+    --roe ./rules-of-engagement.md --window-start 2026-02-01 --window-end 2026-02-14 \
+    --authorization ./signed-authorization.pdf
+
+# scan under the project: its scope is applied, its window gates active work,
+# and findings are ingested into the project's ledger
+allscan app.acme.test --i-have-authorization --all --active --project acme
+
+allscan project show acme                     # engagement status
+allscan findings list acme --status open      # the findings ledger
+allscan findings set-status acme <fp> false-positive --note "WAF test page"
+allscan evidence add acme ./screenshot.png --note "login bypass attempt"
+allscan evidence verify acme                  # chain-of-custody integrity check
+allscan retest acme --run <new-run>.json      # fixed / not-fixed / regression
+```
+
+- **Scope** from the project is merged into the scan's allow/deny, so active
+  probing stays in bounds.
+- **Testing window**: active probing is automatically disabled outside the
+  window (passive recon still runs).
+- **Findings ledger**: findings are deduped by a stable fingerprint and carry a
+  status workflow (`open → confirmed / false-positive / fixed / accepted /
+  regression`) with first/last-seen and history.
+- **Retest**: compares a fresh run to the ledger — absent findings become
+  `fixed`, reappearing ones become `regression`.
+- **Evidence**: files are copied into the project with a SHA-256, size,
+  timestamp and tester identity; every action is appended to an activity log
+  (`ALLSCAN_TESTER` sets the attributed identity).
+
+---
+
+## Active probing (detection mode)
+
+By default allscan is **passive** — it observes. The opt-in **active** profile
+(`--active`, or the toggle on the TUI settings screen) additionally sends
+requests to *confirm* weaknesses, using benign markers and response/error/timing
+signatures. It is **detection-only**: it identifies and reports, and never
+exploits — no data extraction, no shell, no state change.
+
+```bash
+# passive run (default)
+allscan example.com --i-have-authorization --all
+
+# active, detection-only, with an explicit scope
+allscan example.com --i-have-authorization --all --active \
+    --scope-allow "api.example.com,10.0.0.0/24" \
+    --scope-deny  "payments.example.com"
+```
+
+Checks in this phase: reflected input (XSS sink), open redirect, error-based
+SQL-injection signature, and confirmed directory listing. Each active finding is
+`{type, location, severity, evidence, confidence, note:"manual validation required"}`.
+
+**Hard safety controls (always on for active mode):**
+
+- Gated behind the authorization confirmation **and** the explicit `--active` flag.
+- **Scope-enforced** — every request's host is checked against the target + an
+  allowlist, minus a denylist (denylist wins). Out-of-scope hosts are blocked
+  and logged; nothing is sent to them.
+- **Rate-limited and concurrency-capped**, with a conservative active-only cap.
+- **Kill switch / cancel** — the TUI Stop key and `Ctrl+C` halt probing and save
+  partial results; an **automatic stop condition** halts after a configurable
+  run of consecutive request errors.
+- **Non-destructive by default** with a **production-target warning**
+  (acknowledge with `--allow-production`).
+- Every active request (and every scope block) is written to the audit log.
+
+> Active markers are inert: alphanumeric reflect tokens, a single quote for
+> error-based SQL signatures, and a non-resolvable `.invalid` redirect target.
+> No payload changes server state. Findings still require manual validation.
+
+---
+
+## The terminal UI
+
+The TUI walks through a short flow; all screens work with arrow keys, `Tab`,
+`Enter`, and `Space`. Key bindings are shown in the footer of every screen.
+
+**1. Welcome / target entry** — enter a domain or IP and tick the required
+*"I have authorization to test this target"* box. The scan cannot start until
+both are valid. Press **`A`** (or the **Allscan (run everything)** button) to
+confirm target + authorization once and run *all* modules back-to-back with
+default settings — skipping the checklist and settings screens. This is the
+menu-driven equivalent of the `--all` CLI flag.
+
+```
+╭─ allscan — security recon for authorized testing ─────────────────────────╮
+│  Scanning systems without explicit authorization may be illegal.          │
+│  [A] Allscan (run everything)   [P] Past scans   [Esc] Quit               │
+│  ───────────────────────────────────────────────────────────────────     │
+│  Target (domain or IP):                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ example.com                                                         │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│  [x] I have authorization to test this target                            │
+│   ( ▶ Allscan (run everything) )  ( Configure & Scan → )  ( Past )  ( Quit )│
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+The **Allscan** run chains Subdomain Discovery → Port/Service Scan → Web
+Enumeration → HTML/Header Analysis → CVE Correlation automatically, shows the
+same live per-module status + findings counter + activity log, and ends on the
+same results screen with JSON/Markdown/HTML export.
+
+**2. Module checklist** — a `SelectionList`: ↑/↓ to move, `Space` to toggle,
+`a` = all, `n` = none.
+
+```
+  Select modules  (↑/↓ move · space toggle · a=all · n=none · enter=continue)
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ [X] Network/Host Discovery      [X] SSL/TLS Deep Audit                  │
+  │ [X] Subdomain Discovery         [X] Cloud Exposure                      │
+  │ [X] DNS Deep-Dive               [X] WAF/CDN & Rate-limit Detection      │
+  │ [X] Email Security (SPF/…)      [X] CVE Correlation                     │
+  │ [X] Port/Service Scan           [X] Compliance Checklist                │
+  │ [X] Web Enumeration             [X] Active Probing (detection)          │
+  │ [X] API & Tech Fingerprinting                                           │
+  │ [X] HTML/Header Analysis                                                │
+  └───────────────────────────────────────────────────────────────────────┘
+  (Active Probing only sends requests when --active / the settings toggle is on.)
+```
+
+**3. Settings** — full-port toggle, skip-nmap, OS detection, thread count,
+rate limit, timeout, output directory.
+
+**4. Live scan** — a status row per module (queued → running → done), a
+live-updating findings counter, and a scrolling activity log. `Ctrl+C` or `s`
+stops gracefully and still saves partial results.
+
+```
+  Scanning 127.0.0.1   (modules: web, headers)
+  ┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓   ╭─ Live counter ─╮
+  ┃ Module                 ┃ Status    ┃   │                │
+  ┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━┩   │       12       │
+  │ Web Enumeration        │ ✓ done    │   │    findings    │
+  │ HTML/Header Analysis   │ ▶ running │   │                │
+  └────────────────────────┴───────────┘   ╰────────────────╯
+  ╭─ Activity log ───────────────────────────────────────────╮
+  │ web      http://127.0.0.1 -> 200 Test Site               │
+  │ headers  Missing content-security-policy header          │
+  ╰──────────────────────────────────────────────────────────╯
+```
+
+**5. Results** — findings in a scrollable table, colour-coded by severity,
+with an expandable detail pane showing description + evidence. Export with
+`j` (JSON), `m` (Markdown), `h` (HTML); `r` starts a new scan; `p` opens past
+scans.
+
+**6. Past scans + diff** — lists previous runs from the output directory.
+`Enter` reopens a run in the results view; `Space` marks two runs of the same
+target and `d` shows a diff (new / resolved findings).
+
+### Example findings (real run against a local test server)
+
+```
+INFO    web      http://127.0.0.1 [200] Test Site
+INFO    web      http://127.0.0.1 tech: SimpleHTTP/0.6 Python/3.13
+MEDIUM  headers  Missing content-security-policy header
+LOW     headers  Verbose header server: SimpleHTTP/0.6 Python/3.13
+LOW     html     Interesting HTML comment
+MEDIUM  html     Outdated library: jquery 1.7.2
+HIGH    html     Risky inline JS: Hardcoded credential in inline script
+```
+
+---
+
+## Output & audit trail
+
+Each run writes to the output directory:
+
+- `allscan_<target>_<timestamp>.json` — structured results (source of truth)
+- `allscan_<target>_<timestamp>.md` — Markdown summary
+- `allscan_<target>_<timestamp>.html` — standalone HTML report
+- `audit.log` — append-only JSONL of every outbound action (DNS query, HTTP
+  request, nmap invocation, NVD query …) with timestamps, for a full audit
+  trail
+
+---
+
+## Project layout
+
+```
+allscan/
+├── __init__.py        package metadata
+├── __main__.py        `python -m allscan`
+├── main.py            CLI entry point + headless rich runner
+├── tui.py             textual terminal UI (all screens)
+├── engine.py          scan orchestration + cancellation
+├── base.py            Module interface + ModuleContext + registry
+├── config.py          defaults, YAML loading, Config dataclass
+├── models.py          Finding / ScanResult / Severity
+├── utils.py           rate limiter, audit log, validation, secret scan
+├── netdiscover.py     ping sweep / ARP / traceroute host discovery
+├── recon.py           subdomain & asset discovery
+├── dnsx.py            DNS deep-dive (records, DNSSEC, cache snooping)
+├── whois_rdap.py      WHOIS / RDAP registration (registry name: whois)
+├── asn.py             ASN / IP-range discovery (Team Cymru)
+├── certs.py           certificate + CT-log discovery & monitoring
+├── surface.py         attack-surface + infra-relationship mapping
+├── email_sec.py       SPF / DKIM / DMARC posture (registry name: email)
+├── scan.py            port/service scanning (nmap wrapper + fallback)
+├── web.py             web enumeration & content discovery
+├── fingerprint.py     API endpoint / CMS / framework fingerprinting
+├── headers.py         HTML source + security header analysis
+├── tls.py             SSL/TLS deep audit (protocol matrix, chain, expiry)
+├── cloud.py           cloud bucket + metadata-endpoint exposure
+├── waf.py             WAF/CDN fingerprint + rate-limit observation
+├── scope.py           scope enforcement (allow/deny, out-of-scope blocking)
+├── integrations.py    optional external-scanner wrappers (opt-in; parsers)
+├── active.py          active probing (detection-only; gated behind --active)
+├── vulns.py           CVE correlation (NVD + CIRCL)
+├── exploitrefs.py     exploit REFERENCES + KEV/EPSS enrichment (no payloads)
+├── compliance.py      baseline pass/fail checklist roll-up
+├── vulnintel.py       CPE, vuln-age, business-impact risk scoring, FP suppression
+├── mapping.py         ATT&CK / STRIDE / OWASP-NIST-CIS-PCI mapping tables + risk
+├── threatmodel.py     threat-model & compliance roll-up (risk matrix, mappings)
+├── platform.py        engagement projects: scope/RoE/window/auth, ledger, retest, evidence
+├── report.py          JSON/Markdown/HTML reporting + diff + aggregate
+├── report_pdf.py      PDF report (ReportLab; exec summary + risk table)
+└── notify.py          result delivery (Discord webhook: JSON + HTML)
+tests/                 offline unit tests (no network)
+requirements.txt
+config.example.yaml
+pyproject.toml
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest -q                 # offline test suite (no network access needed)
+```
+
+The engine is UI-agnostic: modules implement a tiny `Module.run(ctx)` contract
+and emit `Finding` objects. Cancellation is cooperative via a shared token, so
+both the CLI (`Ctrl+C`) and the TUI (Stop key) halt cleanly and preserve
+partial results.
+
+---
+
+## Responsible use
+
+allscan is intended for security professionals testing their own
+infrastructure or systems they are explicitly authorized to assess
+(penetration tests, bug-bounty programs with in-scope assets, CTFs, lab
+environments). It deliberately:
+
+- requires an authorization confirmation before any module runs,
+- rate-limits outbound activity to avoid hammering targets,
+- logs every action for an audit trail,
+- lists CVEs **informationally only** and ships **no** proof-of-concept or
+  exploit code.
+
+You are responsible for ensuring you have permission to test any target.
+
+## License
+
+MIT
